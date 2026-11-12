@@ -1,0 +1,35 @@
+# KubeGuard scenario 4: database unreachable for the real backend (namespace my-namespace).
+# Network partition between the backend pods and PostgreSQL. Running statements fail after the
+# 5s socket timeout (JDBC error spans), new connections fail to be acquired (failed SERVER spans
+# with JDBCConnectionException). KubeGuard's dependency-connectivity rule fires for
+# my-app -> my-app-postgresql.
+#
+# Side effects: the backend's readiness check fails, so both pods leave the Service after ~30s
+# (liveness stays up, no restarts). kagent's health check would report it if it ran meanwhile.
+# Ends by itself after 5 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/backend-db-connectivity.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/backend-db-connectivity.yaml   # recover
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubeguard-backend-db-connectivity
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - my-namespace
+    labelSelectors:
+      app.kubernetes.io/name: my-app-postgresql
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - my-namespace
+      labelSelectors:
+        app.kubernetes.io/name: my-app
+  duration: 5m

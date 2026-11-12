@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kubeguard-demo
+description: KubeGuard deterministic incident detection plus its demo environment (mock OTel stream, downstream stubs, OTel Collector, Alertmanager)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

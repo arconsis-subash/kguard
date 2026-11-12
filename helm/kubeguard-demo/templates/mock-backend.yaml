@@ -1,0 +1,55 @@
+{{- if .Values.mockBackend.enabled }}
+{{- $ctx := dict "name" "mock-backend" "root" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-backend
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeguard-demo.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "kubeguard-demo.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: mock-backend
+          image: "{{ .Values.mockBackend.image.repository }}:{{ .Values.mockBackend.image.tag }}"
+          imagePullPolicy: {{ .Values.mockBackend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MOCK_PRICING_URL
+              value: http://pricing:5678/
+            - name: MOCK_INVENTORY_URL
+              value: http://inventory:5678/
+            - name: OTEL_COLLECTOR_ENDPOINT
+              value: http://otel-collector:4317
+            # The backend load sends "Connection: close" so requests spread over all backend pods.
+            - name: JAVA_OPTS_APPEND
+              value: -Djdk.httpclient.allowRestrictedHeaders=connection
+            - name: MOCK_BACKEND_LOAD_URL
+              value: {{ .Values.mockBackend.backendLoadUrl | quote }}
+            # GET /api/quote reads its cached quote from here. Its own volume, so the IOChaos of the
+            # p95 scenario (chaos-mesh/experiments/kubeguard/service-latency.yaml) slows only this file.
+            - name: MOCK_CACHE_DIR
+              value: /var/cache/mock
+          volumeMounts:
+            - name: quote-cache
+              mountPath: /var/cache/mock
+          readinessProbe:
+            httpGet: {path: /q/health/ready, port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.mockBackend.resources | nindent 12 }}
+      volumes:
+        - name: quote-cache
+          emptyDir:
+            sizeLimit: 1Mi
+{{- end }}

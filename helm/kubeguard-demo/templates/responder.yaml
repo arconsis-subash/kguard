@@ -1,0 +1,284 @@
+{{- if .Values.responder.enabled }}
+{{- $ctx := dict "name" "kubeguard-responder" "root" . }}
+{{- $target := .Values.responder.targetNamespace }}
+# Alertmanager webhook receiver: asks kagent for a diagnosis, executes an allowed action
+# in the target namespace, and lets KubeGuard verify it (README.md, "Responder").
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeguard-responder
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+---
+# The only writes the responder may make, in the target namespace: delete pods, patch the
+# allow-listed Deployments (restart, rollback), and create Events (its audit record, no reads).
+# Reads are needed to check a pod's owner and a Deployment's revisions. The admission policies
+# below narrow this further.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeguard-responder
+  namespace: {{ $target }}
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # list: revisions and readiness of a Deployment's ReplicaSets, checked before a rollback
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: {{ .Values.responder.allowedDeployments | toJson }}
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeguard-responder
+  namespace: {{ $target }}
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeguard-responder
+subjects:
+  - kind: ServiceAccount
+    name: kubeguard-responder
+    namespace: {{ .Release.Namespace }}
+---
+# Enforced by the API server, independent of the responder's code and of what the agent proposes:
+# the responder may only delete pods of an allow-listed Deployment (owned by one of its
+# ReplicaSets, "<deployment>-<hash>"). Never PostgreSQL (a StatefulSet), a bare pod or any other workload.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kubeguard-responder-pod-delete
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations: ["DELETE"]
+  matchConditions:
+    - name: responder
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:kubeguard-responder'
+  variables:
+    - name: allowed
+      expression: {{ .Values.responder.allowedDeployments | toJson | squote }}
+  validations:
+    - expression: >-
+        oldObject.metadata.?ownerReferences.orValue([]).exists(o, o.kind == 'ReplicaSet' &&
+        variables.allowed.exists(d, o.name.startsWith(d + '-') &&
+        o.name.substring(size(d) + 1).matches('^[a-z0-9]+$')))
+      messageExpression: >-
+        'The KubeGuard responder may only delete pods of the Deployments ' + variables.allowed.join(', ') +
+        ', not ' + oldObject.metadata.name
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kubeguard-responder-pod-delete
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  policyName: kubeguard-responder-pod-delete
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $target }}
+---
+# What a Deployment patch by the responder may change. RBAC can only say "may patch Deployment X";
+# without this a patch could swap the image or scale to zero. Two shapes are allowed:
+# - restart: only the restartedAt annotation of the pod template changes (`kubectl rollout restart`)
+# - rollback: the pod template is replaced (fabric8 copies an older ReplicaSet's template back). The
+#   API server cannot check that the template really comes from an older ReplicaSet, so a rollback must
+#   at least keep to images from rollbackImagePrefixes, the same containers with the same command and
+#   args, the same init containers and ServiceAccount, and no privileged or host access: a stolen
+#   responder token cannot start foreign code or a sidecar through it. What it still allows is a
+#   different image tag, env or resources of the same containers, which is exactly what a rollback
+#   restores; that the template is an older revision is ensured by the responder's code only.
+# Replicas, selector, strategy and the other rollout settings never change.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kubeguard-responder-deployment-update
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["deployments"]
+        operations: ["UPDATE"]
+  matchConditions:
+    - name: responder
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:kubeguard-responder'
+  variables:
+    - name: prefixes
+      expression: {{ .Values.responder.rollbackImagePrefixes | toJson | squote }}
+    - name: restartKey
+      expression: "'kubectl.kubernetes.io/restartedAt'"
+    - name: newPod
+      expression: object.spec.template
+    - name: oldPod
+      expression: oldObject.spec.template
+    - name: newAnnotations
+      expression: variables.newPod.metadata.?annotations.orValue({})
+    - name: oldAnnotations
+      expression: variables.oldPod.metadata.?annotations.orValue({})
+    - name: isRestart
+      expression: >-
+        variables.newPod.spec == variables.oldPod.spec &&
+        variables.newPod.metadata.?labels.orValue({}) == variables.oldPod.metadata.?labels.orValue({}) &&
+        variables.newAnnotations.all(k, k == variables.restartKey ||
+          (k in variables.oldAnnotations && variables.oldAnnotations[k] == variables.newAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k == variables.restartKey || k in variables.newAnnotations)
+    # Pod labels pick Services and NetworkPolicies, so they stay. fabric8's undo copies the old ReplicaSet's
+    # template including its pod-template-hash label; that one may differ.
+    - name: sameLabels
+      expression: >-
+        variables.newPod.metadata.?labels.orValue({}).all(k, k == 'pod-template-hash' ||
+          variables.oldPod.metadata.?labels.orValue({})[?k] == optional.of(variables.newPod.metadata.labels[k])) &&
+        variables.oldPod.metadata.?labels.orValue({}).all(k, k == 'pod-template-hash' ||
+          k in variables.newPod.metadata.?labels.orValue({}))
+    - name: isSafeRollback
+      expression: >-
+        variables.sameLabels &&
+        variables.newPod.spec.containers.all(c, variables.prefixes.exists(p, c.image.startsWith(p)) &&
+          !c.?securityContext.?privileged.orValue(false) &&
+          variables.oldPod.spec.containers.exists(o, o.name == c.name &&
+            o.?command.orValue([]) == c.?command.orValue([]) && o.?args.orValue([]) == c.?args.orValue([]))) &&
+        variables.newPod.spec.?initContainers.orValue([]) == variables.oldPod.spec.?initContainers.orValue([]) &&
+        variables.newPod.spec.?serviceAccountName.orValue('') == variables.oldPod.spec.?serviceAccountName.orValue('') &&
+        !variables.newPod.spec.?hostNetwork.orValue(false) &&
+        !variables.newPod.spec.?hostPID.orValue(false) &&
+        !variables.newPod.spec.?hostIPC.orValue(false) &&
+        variables.newPod.spec.?volumes.orValue([]).all(v, !has(v.hostPath))
+  validations:
+    - expression: >-
+        object.spec.?replicas.orValue(1) == oldObject.spec.?replicas.orValue(1) &&
+        object.spec.selector == oldObject.spec.selector &&
+        object.spec.?strategy.orValue({}) == oldObject.spec.?strategy.orValue({}) &&
+        object.spec.?paused.orValue(false) == oldObject.spec.?paused.orValue(false) &&
+        object.spec.?minReadySeconds.orValue(0) == oldObject.spec.?minReadySeconds.orValue(0) &&
+        object.spec.?revisionHistoryLimit.orValue(10) == oldObject.spec.?revisionHistoryLimit.orValue(10) &&
+        object.spec.?progressDeadlineSeconds.orValue(600) == oldObject.spec.?progressDeadlineSeconds.orValue(600)
+      message: >-
+        The KubeGuard responder may not change replicas, selector, strategy or other rollout settings.
+    - expression: variables.isRestart || variables.isSafeRollback
+      messageExpression: >-
+        'The KubeGuard responder may only restart ' + object.metadata.name + ' (restartedAt annotation) or roll it' +
+        ' back to images from ' + variables.prefixes.join(', ') + ' with the same containers, commands and' +
+        ' ServiceAccount and without privileged or host access'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kubeguard-responder-deployment-update
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  policyName: kubeguard-responder-deployment-update
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $target }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeguard-responder
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  # One replica: incident runs are kept in memory and must not be handled twice.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeguard-demo.labels" $ctx | nindent 8 }}
+    spec:
+      serviceAccountName: kubeguard-responder
+      {{- include "kubeguard-demo.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: responder
+          image: "{{ .Values.responder.image.repository }}:{{ .Values.responder.image.tag }}"
+          imagePullPolicy: {{ .Values.responder.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: RESPONDER_NAMESPACE
+              value: {{ $target | quote }}
+            - name: RESPONDER_DRY_RUN
+              value: {{ .Values.responder.dryRun | quote }}
+            - name: RESPONDER_AUTONOMY
+              value: {{ include "kubeguard-demo.autonomy" .Values.responder.autonomy | quote }}
+            - name: RESPONDER_DEFAULT_ACTIONS
+              value: {{ include "kubeguard-demo.autonomy" .Values.responder.defaultActions | quote }}
+            - name: RESPONDER_APPROVAL_TIMEOUT
+              value: {{ .Values.responder.approvalTimeout | quote }}
+            - name: RESPONDER_POLICY_COOLDOWN
+              value: {{ .Values.responder.cooldown | quote }}
+            - name: RESPONDER_POLICY_MAX_ACTIONS
+              value: {{ .Values.responder.repeatLimit.maxActions | quote }}
+            - name: RESPONDER_POLICY_ACTION_WINDOW
+              value: {{ .Values.responder.repeatLimit.window | quote }}
+            - name: RESPONDER_POLICY_ALLOWED_DEPLOYMENTS
+              value: {{ join "," .Values.responder.allowedDeployments | quote }}
+            - name: RESPONDER_SERVICES
+              value: {{ join "," .Values.responder.allowedDeployments | quote }}
+            - name: RESPONDER_GITHUB_REPOSITORY
+              value: {{ .Values.responder.githubRepository | quote }}
+            {{- with .Values.responder.githubTokenSecret }}
+            - name: RESPONDER_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: GITHUB_TOKEN
+                  optional: true
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /q/health/ready, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /q/health/live, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 160Mi}
+            limits: {memory: 320Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeguard-responder
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}

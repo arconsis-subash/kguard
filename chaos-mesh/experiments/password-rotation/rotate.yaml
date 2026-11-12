@@ -1,0 +1,114 @@
+# Database password rotation, as a security policy would run it (for example monthly at 03:00):
+#   1. a new random password for the backend's role in PostgreSQL,
+#   2. the new password into the Secret my-app-db,
+#   3. sessions still open with the old password are ended.
+# The running backend pods read the password from the Secret when they started, and Kubernetes does not restart
+# pods when a Secret changes. So every new database connection fails ("password authentication failed") and the
+# backend loses its readiness: it is down until someone restarts it. KGuard is expected to find this and restart
+# the backend (rollout-restart); the restarted pods read the new password.
+#
+# The first rotation keeps the original password in the Secret as "previous-password", so restore.yaml can put it
+# back. A deploy of the chart re-renders the Secret with the current password only (it keeps it via lookup), which
+# drops "previous-password"; then there is nothing to restore and the rotated password simply stays.
+#
+# The postgres-exporter sidecar of PostgreSQL also reads the password at start, so the database metrics stop until
+# restore.yaml puts the original password back. Its ServiceAccount and Role are in kagent/ask-ui/k8s/console.yaml.
+# Started from the console (kagent/ask-ui), or:
+#   kubectl apply -f chaos-mesh/experiments/password-rotation/rotate.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-password-rotation
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/name: db-password-rotation
+    app.kubernetes.io/part-of: kguard-showcase
+spec:
+  backoffLimit: 0
+  # Kept for an hour: its logs are the evidence of what changed and when.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-password-rotation
+        app.kubernetes.io/part-of: kguard-showcase
+    spec:
+      serviceAccountName: db-password-rotation
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      initContainers:
+        # Steps 1 and 3 in PostgreSQL; writes the Secret patch for step 2.
+        - name: rotate-password
+          image: postgres:17-alpine
+          securityContext:
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PGHOST
+              value: my-app-postgresql
+            - name: PGDATABASE
+              value: app
+            - name: PGUSER
+              value: app
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-app-db
+                  key: password
+            - name: PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: my-app-db
+                  key: previous-password
+                  optional: true
+          command:
+            - sh
+            - -ec
+            - |
+              NEW=$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+              ORIGINAL=${PREVIOUS:-$PGPASSWORD}
+              # One session: after the ALTER ROLE the old password no longer works for a second connection. Each
+              # statement commits on its own, so the new password is in force before the old sessions end and none
+              # of them can reconnect with the old one in between. The terminate spares this session.
+              ENDED=$(psql -v ON_ERROR_STOP=1 -tAq <<SQL
+              ALTER ROLE $PGUSER PASSWORD '$NEW';
+              SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+               WHERE usename = current_user AND pid <> pg_backend_pid();
+              SQL
+              )
+              printf '{"stringData":{"password":"%s","previous-password":"%s"}}' "$NEW" "$ORIGINAL" > /work/patch.json
+              echo "$(date -u +%FT%TZ) rotated the password of database role $PGUSER"
+              echo "$(date -u +%FT%TZ) ended $ENDED open sessions that used the old password"
+          volumeMounts:
+            - name: work
+              mountPath: /work
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+      containers:
+        # Step 2: the new password into the Secret. The kubectl image has no shell; the patch comes from the file.
+        - name: update-secret
+          image: registry.k8s.io/kubectl:v1.33.11
+          args: ["patch", "secret", "my-app-db", "--type=merge", "--patch-file=/work/patch.json"]
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+              readOnly: true
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}

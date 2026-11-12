@@ -1,0 +1,37 @@
+# KubeGuard scenario 3: slow database for the real backend (namespace my-namespace).
+# Delays the packets PostgreSQL sends to the backend pods by 400ms (+-50ms). Every JDBC statement
+# takes ~0.4s instead of a few ms, so KubeGuard's downstream-latency rule (p95 > 250ms) fires for
+# my-app -> my-app-postgresql. Readiness stays up (DB check < 1s).
+#
+# Scope: only traffic from the PostgreSQL pod to the backend pods; metrics scraping is not delayed.
+# Ends by itself after 5 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/backend-db-latency.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/backend-db-latency.yaml   # recover
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubeguard-backend-db-latency
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - my-namespace
+    labelSelectors:
+      app.kubernetes.io/name: my-app-postgresql
+  delay:
+    latency: 400ms
+    jitter: 50ms
+    correlation: "0"
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - my-namespace
+      labelSelectors:
+        app.kubernetes.io/name: my-app
+  duration: 5m

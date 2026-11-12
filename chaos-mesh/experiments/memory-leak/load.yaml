@@ -1,0 +1,73 @@
+# "Heal before it breaks": steady use of the backend's report export (POST /api/reports), whose cache is never
+# evicted (your app's report endpoint; any cache that is never evicted will do). About 2 reports per second, a new
+# connection each, so they spread over both pods: each pod's heap grows by about 1 MiB/s and would be full
+# (~250 MiB) after about 4 minutes, both at almost the same time. KubeGuard's memory-exhaustion rule forecasts it
+# after about 1 minute; KGuard replaces the pods one at a time before the heap is full.
+#
+# The load stops as soon as it sees a backend process that started after the load began (GET /api/info, startedAt):
+# KGuard has restarted the backend, and the demo should end there. In reality the leak would go on and KGuard would
+# restart again before every crash until the code is fixed. Without KGuard it runs until the 6-minute cap, by which
+# time the heaps are full (OutOfMemoryError). Not Chaos Mesh: a plain Job.
+#   kubectl apply -f chaos-mesh/experiments/memory-leak/load.yaml
+# Clean up (the leaked memory stays in the pods until they restart):
+#   kubectl -n my-namespace delete job memory-leak-load
+#   kubectl -n my-namespace rollout restart deployment/my-app
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memory-leak-load
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/name: memory-leak-load
+    app.kubernetes.io/part-of: kguard-showcase
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 390
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memory-leak-load
+        app.kubernetes.io/part-of: kguard-showcase
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: report-export
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              BEGAN=$(date -u +%Y-%m-%dT%H:%M:%S)
+              END=$(( $(date +%s) + 360 ))
+              n=0
+              echo "$BEGAN started the report export load"
+              while [ "$(date +%s)" -lt "$END" ]; do
+                curl -s -o /dev/null -m 5 -X POST -H 'Connection: close' http://my-app/api/reports &
+                n=$((n + 1))
+                if [ $((n % 8)) -eq 0 ]; then
+                  # ISO-8601 UTC timestamps compare as strings.
+                  STARTED=$(curl -s -m 3 -H 'Connection: close' http://my-app/api/info | sed -n 's/.*"startedAt":"\([^"]*\)".*/\1/p')
+                  if [ -n "$STARTED" ] && [ "$(expr "$STARTED" \> "$BEGAN")" = 1 ]; then
+                    echo "$(date -u +%FT%TZ) a backend pod started at $STARTED, after the load began: it was restarted, stopping"
+                    break
+                  fi
+                fi
+                sleep 0.5
+              done
+              wait
+              echo "$(date -u +%FT%TZ) requested $n reports"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}

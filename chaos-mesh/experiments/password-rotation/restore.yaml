@@ -1,0 +1,99 @@
+# Undoes rotate.yaml: puts the original password ("previous-password" in the Secret) back into the Secret and into
+# PostgreSQL. Without "previous-password" (never rotated, or a deploy re-rendered the Secret) it changes nothing.
+#
+# It does not end any session: the backend pods keep their open connections while the console restarts them
+# (kubectl rollout restart), so the restore causes no outage. The postgres-exporter sidecar works again as soon as
+# the original password is back, since that is the one it read at start.
+#   kubectl apply -f chaos-mesh/experiments/password-rotation/restore.yaml
+#   kubectl -n my-namespace wait --for=condition=complete job/db-password-restore
+#   kubectl -n my-namespace rollout restart deployment/my-app
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-password-restore
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/name: db-password-restore
+    app.kubernetes.io/part-of: kguard-showcase
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-password-restore
+        app.kubernetes.io/part-of: kguard-showcase
+    spec:
+      serviceAccountName: db-password-rotation
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+      initContainers:
+        - name: restore-password
+          image: postgres:17-alpine
+          securityContext:
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PGHOST
+              value: my-app-postgresql
+            - name: PGDATABASE
+              value: app
+            - name: PGUSER
+              value: app
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-app-db
+                  key: password
+            - name: PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: my-app-db
+                  key: previous-password
+                  optional: true
+          command:
+            - sh
+            - -ec
+            - |
+              if [ -z "${PREVIOUS:-}" ]; then
+                echo '{}' > /work/patch.json
+                echo "$(date -u +%FT%TZ) no previous password in the Secret: nothing to restore"
+                exit 0
+              fi
+              # The database here, the Secret right after in the update-secret container. The running pods keep
+              # their open connections meanwhile; only a pod that starts in those seconds would read a stale value.
+              printf '{"stringData":{"password":"%s"},"data":{"previous-password":null}}' "$PREVIOUS" > /work/patch.json
+              psql -v ON_ERROR_STOP=1 -qc "ALTER ROLE $PGUSER PASSWORD '$PREVIOUS'"
+              echo "$(date -u +%FT%TZ) restored the original password of database role $PGUSER"
+          volumeMounts:
+            - name: work
+              mountPath: /work
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+      containers:
+        - name: update-secret
+          image: registry.k8s.io/kubectl:v1.33.11
+          args: ["patch", "secret", "my-app-db", "--type=merge", "--patch-file=/work/patch.json"]
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+              readOnly: true
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}

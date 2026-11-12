@@ -1,0 +1,12 @@
+# LLM used by the KubeGuard incident agent.
+# Uses the same kagent-openai Secret as kagent/values.yaml.
+apiVersion: kagent.dev/v1alpha2
+kind: ModelConfig
+metadata:
+  name: kguard-model
+  namespace: kagent
+spec:
+  provider: OpenAI
+  model: gpt-4.1-mini
+  apiKeySecret: kagent-openai
+  apiKeySecretKey: OPENAI_API_KEY

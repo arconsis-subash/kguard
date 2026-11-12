@@ -1,0 +1,19 @@
+# Release "kubeguard" in namespace "kubeguard": detection and repair only. This namespace is NOT
+# annotated for Chaos Mesh, so no experiment can select these pods.
+#   helm upgrade --install kubeguard helm/kubeguard-demo -n kubeguard -f helm/kubeguard-demo/values-kubeguard.yaml
+kubeguard:
+  properties:
+    kubeguard.alertmanager.static-labels.namespace: kubeguard
+    kubeguard.alertmanager.generator-url: http://kubeguard.kubeguard.svc:8080/api/incidents
+mockBackend:
+  enabled: false
+downstreams:
+  enabled: false
+otelCollector:
+  enabled: false
+responder:
+  # The showcase heals on its own: every action on auto. The chart default is shadow.
+  autonomy:
+    restart-pod: auto
+    rollout-restart: auto
+    rollback: auto

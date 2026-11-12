@@ -1,0 +1,13 @@
+# Release "kubeguard-demo" in namespace "kubeguard-demo": the chaos targets of the mock scenarios
+# (mock-backend, pricing, inventory) and their Collector. This namespace is annotated for Chaos Mesh.
+#   helm upgrade --install kubeguard-demo helm/kubeguard-demo -n kubeguard-demo -f helm/kubeguard-demo/values-targets.yaml
+kubeguard:
+  enabled: false
+alertmanager:
+  enabled: false
+alertSink:
+  enabled: false
+responder:
+  enabled: false
+otelCollector:
+  kubeguardEndpoint: http://kubeguard.kubeguard.svc:8080

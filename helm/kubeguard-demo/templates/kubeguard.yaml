@@ -1,0 +1,70 @@
+{{- if .Values.kubeguard.enabled }}
+{{- $ctx := dict "name" "kubeguard" "root" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeguard
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  # One replica: incident state is kept in memory.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeguard-demo.labels" $ctx | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/kubeguard-config.yaml") . | sha256sum }}
+    spec:
+      {{- include "kubeguard-demo.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: kubeguard
+          image: "{{ .Values.kubeguard.image.repository }}:{{ .Values.kubeguard.image.tag }}"
+          imagePullPolicy: {{ .Values.kubeguard.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KUBEGUARD_ALERTMANAGER_URL
+              value: {{ .Values.kubeguard.alertmanagerUrl | quote }}
+            # The image's working directory is /home/jboss, so point Quarkus at the mounted file explicitly.
+            - name: QUARKUS_CONFIG_LOCATIONS
+              value: /deployments/config/application.properties
+          volumeMounts:
+            - name: config
+              mountPath: /deployments/config
+              readOnly: true
+          startupProbe:
+            httpGet: {path: /q/health/started, port: http}
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet: {path: /q/health/live, port: http}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /q/health/ready, port: http}
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.kubeguard.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: kubeguard-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeguard
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}

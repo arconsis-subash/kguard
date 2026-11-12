@@ -1,0 +1,8 @@
+KubeGuard demo installed in namespace {{ .Release.Namespace }}.
+
+  kubectl -n {{ .Release.Namespace }} get pods
+  kubectl -n {{ .Release.Namespace }} logs deploy/kubeguard -f
+  kubectl -n {{ .Release.Namespace }} port-forward svc/kubeguard 8080   # GET /api/incidents
+  kubectl -n {{ .Release.Namespace }} port-forward svc/alertmanager 9093
+
+Demo procedure: README.md

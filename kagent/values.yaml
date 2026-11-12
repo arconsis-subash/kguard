@@ -1,0 +1,57 @@
+# Helm values for the kagent chart (oci://ghcr.io/kagent-dev/kagent/helm/kagent).
+# Tested with kagent 0.10.6:
+#   helm upgrade --install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds --version 0.10.6 -n kagent --create-namespace
+#   helm upgrade --install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent --version 0.10.6 -n kagent -f kagent/values.yaml
+
+providers:
+  default: openAI
+  openAI:
+    provider: OpenAI
+    model: "gpt-4.1-mini"
+    # Create it first: kubectl -n kagent create secret generic kagent-openai --from-literal=OPENAI_API_KEY=<key>
+    apiKeySecretRef: kagent-openai
+    apiKeySecretKey: OPENAI_API_KEY
+
+# The controller only watches the kagent namespace and gets a Role there
+# instead of a cluster-wide ClusterRole.
+rbac:
+  namespaces:
+    - kagent
+
+# The shared tool server that agents call. Its Kubernetes access is read-only
+# (get/list/watch, no Secrets) and limited to the kagent namespace and the
+# backend namespace, instead of the chart's default cluster-admin.
+kagent-tools:
+  # Traces from the tool server (see otel below).
+  otel:
+    tracing:
+      enabled: false
+      exporter:
+        otlp:
+          endpoint: http://otel-collector.observability.svc:4317
+  rbac:
+    readOnly: true
+    allowSecrets: false
+    namespaces:
+      - kagent
+      - my-namespace
+
+# kmcp manages MCPServer resources. Scope it to the kagent namespace as well.
+kmcp:
+  rbac:
+    namespaces:
+      - kagent
+
+# Traces from the controller. Set enabled and your OTLP gRPC endpoint to use them.
+otel:
+  tracing:
+    enabled: false
+    exporter:
+      otlp:
+        endpoint: http://otel-collector.observability.svc:4317
+
+# Not used: the bundled observability agent and the Grafana MCP server it needs.
+observability-agent:
+  enabled: false
+grafana-mcp:
+  enabled: false

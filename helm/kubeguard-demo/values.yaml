@@ -1,0 +1,157 @@
+# KubeGuard and its demo environment. These defaults install everything into one namespace. The
+# cluster uses two releases instead, so that Chaos Mesh can never hit the detection and repair side:
+#   kubeguard       (namespace kubeguard, no chaos):     -f values-kubeguard.yaml  KubeGuard, Alertmanager, responder, sink
+#   kubeguard-demo  (namespace kubeguard-demo, chaos):   -f values-targets.yaml    mock-backend, pricing, inventory, collector
+# See README.md.
+
+# Pull Secret for your registry, if it needs one, e.g. [{name: my-registry}].
+imagePullSecrets: []
+
+# KubeGuard: consumes OTLP traces, detects incidents, sends alerts to Alertmanager.
+kubeguard:
+  enabled: true
+  image:
+    repository: registry.example.com/kguard/kubeguard
+    tag: "0.7.0"
+    pullPolicy: IfNotPresent
+  alertmanagerUrl: http://alertmanager:9093
+  # Rendered into /deployments/config/application.properties and overrides the defaults
+  # in kubeguard/src/main/resources/application.properties.
+  properties:
+    # The demo's mock stream and the real backend (its traces arrive via the shared
+    # otel-collector in my-namespace, see helm/otel-collector/values.yaml).
+    kubeguard.services: mock-backend,my-app
+    kubeguard.alertmanager.static-labels.namespace: kubeguard-demo
+    kubeguard.alertmanager.static-labels.cluster: my-cluster
+    kubeguard.alertmanager.generator-url: http://kubeguard.kubeguard-demo.svc:8080/api/incidents
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+
+# Mock OTel input stream: simulates a backend calling the two downstream stubs below.
+mockBackend:
+  enabled: true
+  image:
+    repository: registry.example.com/kguard/kubeguard-mock-backend
+    tag: "0.3.2"
+    pullPolicy: IfNotPresent
+  # Untraced load on the real backend (~1 POST /api/echo per second), so that its own
+  # JDBC/SERVER spans give KubeGuard enough samples. Empty: no load.
+  backendLoadUrl: http://my-app.my-namespace.svc/api/echo
+  resources:
+    requests:
+      cpu: 50m
+      memory: 160Mi
+    limits:
+      memory: 320Mi
+
+# Downstream stubs called by the mock backend. Chaos Mesh targets them by app.kubernetes.io/name.
+downstreams:
+  enabled: true
+  image:
+    repository: hashicorp/http-echo
+    tag: "1.0.0"
+  services:
+    - name: pricing
+      text: '{"price": 42}'
+    - name: inventory
+      text: '{"inStock": true}'
+
+# OpenTelemetry Collector: fans the traces out to the regular trace backend and, filtered to
+# CLIENT spans, to KubeGuard. KubeGuard has its own pipeline, so it is never in the critical path.
+otelCollector:
+  enabled: true
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: "0.161.0"
+  # Stand-in for Tempo/Loki/Prometheus: no trace backend is configured here.
+  # Set e.g. otlp/tempo here once one exists.
+  # Where the demo Collector sends KubeGuard's spans.
+  kubeguardEndpoint: http://kubeguard:8080
+  traceBackendExporter:
+    debug:
+      verbosity: basic
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# Alertmanager: receives KubeGuard's alerts and forwards notifications (firing and resolved) to a
+# webhook. Today that is the alert-sink below; tomorrow the Ops Agent.
+alertmanager:
+  enabled: true
+  image:
+    repository: quay.io/prometheus/alertmanager
+    tag: v0.28.1
+  # Every notification (firing and resolved) goes to all of these: the sink logs it, the
+  # responder acts on it.
+  webhookUrls:
+    - http://alert-sink:8080/alertmanager
+    - http://kubeguard-responder:8080/alertmanager
+  route:
+    groupWait: 5s
+    groupInterval: 10s
+    repeatInterval: 1h
+
+# Responder: Alertmanager -> kagent diagnosis (A2A) -> deterministic policy -> action in the
+# target namespace -> KubeGuard verifies; otherwise a GitHub issue. See README.md.
+responder:
+  enabled: true
+  image:
+    repository: registry.example.com/kguard/kubeguard-responder
+    tag: "0.8.0"
+    pullPolicy: IfNotPresent
+  targetNamespace: my-namespace
+  # The only Deployments the responder may restart, roll back or delete pods of. Enforced three times:
+  # by the policy in its code, by its Role (resourceNames) and by the admission policies in responder.yaml.
+  allowedDeployments:
+    - my-app
+  # A rollback is only admitted when every image of the restored pod template starts with one of these.
+  rollbackImagePrefixes:
+    - registry.example.com/my-team/
+  # true: every action in shadow mode, whatever autonomy says (a kill switch).
+  dryRun: false
+  # Autonomy level per action the policy allows: shadow (record it, escalate, change nothing), approve (wait for
+  # Approve in the console, check the policy again, then act) or auto. Unlisted actions stay in shadow
+  # mode. A new installation starts with everything on shadow and promotes one action at a time on its record
+  # (pilot report: GET /api/report). The showcase release sets auto in values-kubeguard.yaml.
+  autonomy:
+    restart-pod: shadow
+    rollout-restart: shadow
+    rollback: shadow
+  # Action per KubeGuard alert when kagent fails or gives no valid diagnosis. It goes through the same policy and
+  # autonomy level as kagent's proposal, so the AI explains but is not needed to act safely. A restart-pod default
+  # needs exactly one affected pod (several slow pods point at the database, not at a pod). Empty: escalate.
+  defaultActions:
+    KubeGuardMemoryExhaustionPredicted: rollout-restart
+    KubeGuardWorkloadUnavailable: rollout-restart
+    KubeGuardDownstreamLatencyHigh: restart-pod
+    KubeGuardDependencyConnectivityFailure: restart-pod
+  # How long a proposal in approve mode waits for a human before the incident is escalated.
+  approvalTimeout: 15m
+  # At most one action per Deployment within this time (no restart loops). Short for demos;
+  # minutes to hours in real operation.
+  cooldown: 1m
+  # At most maxActions actions per Deployment within window. Beyond that the fix does not last (a leak restarted
+  # again and again), so the incident goes to a human. Every fix also opens a follow-up issue for the cause.
+  # Generous for the showcase, where visitors trigger the scenarios one after another; 3 per 24h in real operation.
+  repeatLimit:
+    maxActions: 10
+    window: 1h
+  # Secret in this namespace with key GITHUB_TOKEN (Issues: read and write) for escalations.
+  # Without it, escalations are only logged.
+  githubTokenSecret: kubeguard-responder-github
+  # Repository the escalation issues go to, as owner/name.
+  githubRepository: my-org/my-repo
+
+# Logs every Alertmanager webhook notification, to show what was sent.
+alertSink:
+  enabled: true
+  image:
+    repository: mendhak/http-https-echo
+    tag: "37"

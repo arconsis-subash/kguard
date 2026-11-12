@@ -1,0 +1,31 @@
+# KubeGuard scenario: backend containers killed again and again (namespace my-namespace).
+# A Chaos Mesh Schedule kills the backend container of one randomly chosen backend pod every 20s.
+# The pods restart over and over: KubeGuard fires KubeGuardPodCrashLooping (pod state from the
+# OTel Collector's k8s_cluster receiver). Neither a restart nor a rollback removes an external
+# kill, and the rollout is not stuck, so the responder should end with a GitHub issue.
+#
+# A Schedule has no duration: delete it to stop.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/backend-container-kill.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/backend-container-kill.yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kubeguard-backend-container-kill
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  schedule: "@every 20s"
+  type: PodChaos
+  historyLimit: 2
+  concurrencyPolicy: Forbid
+  podChaos:
+    action: container-kill
+    mode: one
+    containerNames:
+      - my-app
+    selector:
+      namespaces:
+        - my-namespace
+      labelSelectors:
+        app.kubernetes.io/name: my-app

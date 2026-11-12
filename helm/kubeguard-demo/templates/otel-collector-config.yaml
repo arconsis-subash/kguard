@@ -1,0 +1,52 @@
+{{- if .Values.otelCollector.enabled }}
+{{- $ctx := dict "name" "otel-collector" "root" . }}
+{{- $backends := keys .Values.otelCollector.traceBackendExporter | sortAlpha }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 1s
+      # Keep only what KubeGuard evaluates: CLIENT spans (outgoing calls) and SERVER spans (requests answered).
+      filter/kubeguard:
+        trace_conditions:
+          - span.kind != SPAN_KIND_CLIENT and span.kind != SPAN_KIND_SERVER
+
+    exporters:
+      {{- toYaml .Values.otelCollector.traceBackendExporter | nindent 6 }}
+      otlp_http/kubeguard:
+        endpoint: {{ .Values.otelCollector.kubeguardEndpoint | quote }}
+        encoding: json
+        compression: none
+        timeout: 5s
+        sending_queue:
+          queue_size: 100
+        retry_on_failure:
+          max_elapsed_time: 30s
+
+    service:
+      pipelines:
+        # Regular observability path, unchanged by KubeGuard.
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [{{ join ", " $backends }}]
+        # Additional consumer: a separate pipeline, so a slow or down KubeGuard cannot block the one above.
+        traces/kubeguard:
+          receivers: [otlp]
+          processors: [filter/kubeguard, batch]
+          exporters: [otlp_http/kubeguard]
+{{- end }}

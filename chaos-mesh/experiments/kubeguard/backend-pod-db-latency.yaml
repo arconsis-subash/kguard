@@ -1,0 +1,44 @@
+# KubeGuard scenario 5: one backend pod has a slow path to the database (namespace my-namespace).
+# Delays the packets PostgreSQL sends to ONE randomly chosen backend pod by 400ms (+-50ms). That pod
+# stays Ready (its database health check takes ~0.4s < 1s probe timeout) and keeps serving, so
+# KubeGuard sees its JDBC calls slow down while the other pod stays fast:
+# KubeGuardDownstreamLatencyHigh with the slow pod in `by_instance`. The responder asks kagent,
+# which should propose `restart-pod` for that pod. Chaos Mesh only injects the pods it selected
+# at start, so the replacement pod is fast and KubeGuard resolves the incident: the fix is real.
+#
+# The delay sits on PostgreSQL's side: the backend connects to the PostgreSQL Service IP, which is only
+# translated to the pod IP outside the backend pod, so a filter on the backend side would never match.
+# (A partition of one pod is not usable here: its readiness check fails, the Service stops sending
+# it traffic, and no failing call is left for KubeGuard to see.)
+#
+# Ends by itself after 5 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/backend-pod-db-latency.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/backend-pod-db-latency.yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubeguard-backend-pod-db-latency
+  namespace: my-namespace
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - my-namespace
+    labelSelectors:
+      app.kubernetes.io/name: my-app-postgresql
+  delay:
+    latency: 400ms
+    jitter: 50ms
+    correlation: "0"
+  direction: to
+  target:
+    mode: one
+    selector:
+      namespaces:
+        - my-namespace
+      labelSelectors:
+        app.kubernetes.io/name: my-app
+  duration: 5m

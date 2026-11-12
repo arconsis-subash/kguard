@@ -1,0 +1,34 @@
+# KubeGuard scenario 5: p95 high, the service itself is slow (its downstreams are fine).
+# Delays every read of the quote cache file in mock-backend by 400ms. GET /api/quote reads that file inside
+# the request, so its responses take ~0.4s instead of a few ms, while the calls to pricing stay fast.
+# KubeGuard's service-latency rule (p95 > 250ms) fires for mock-backend "GET /api/quote"; downstream-latency
+# for pricing stays NORMAL. POST /api/order does not read the cache and stays fast.
+#
+# Scope: only the cache volume (/var/cache/mock, an emptyDir) of the mock-backend pod in kubeguard-demo.
+# Ends by itself after 10 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/service-latency.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/service-latency.yaml   # recover
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: kubeguard-service-latency
+  namespace: kubeguard-demo
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: latency
+  mode: all
+  selector:
+    namespaces:
+      - kubeguard-demo
+    labelSelectors:
+      app.kubernetes.io/name: mock-backend
+  containerNames:
+    - mock-backend
+  volumePath: /var/cache/mock
+  path: /var/cache/mock/**/*
+  methods:
+    - read
+  delay: 400ms
+  percent: 100
+  duration: 10m

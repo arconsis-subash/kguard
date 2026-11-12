@@ -1,0 +1,89 @@
+# What KubeGuard needs from your application's OpenTelemetry Collector (contrib distribution).
+# Merge these parts into its config. KubeGuard has its own pipelines and queue, so a slow or
+# missing KubeGuard never blocks your regular export.
+#
+# Replace: my-namespace (where your app runs), my-app (its headless or regular Service for the
+# heap scrape), and the KubeGuard URL if you install it elsewhere than namespace kubeguard.
+# The k8s_cluster and k8sobjects receivers need a ServiceAccount that may get/list/watch pods
+# (and replicasets, deployments) in my-namespace.
+
+receivers:
+  # Traces from your app (CLIENT spans incl. JDBC, SERVER spans) arrive here as usual.
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+  # Restarts, readiness and CrashLoopBackOff, for the pod-crashloop and workload-unavailable rules.
+  k8s_cluster:
+    auth_type: serviceAccount
+    namespaces: [my-namespace]
+    collection_interval: 10s
+    metrics:
+      k8s.container.status.reason:
+        enabled: true
+    resource_attributes:
+      k8s.container.status.last_terminated_reason:
+        enabled: true
+  # The Pod objects, for the stuck Pending / Terminating rules.
+  k8sobjects:
+    auth_type: serviceAccount
+    objects:
+      - name: pods
+        mode: pull
+        interval: 10s
+        namespaces: [my-namespace]
+  # JVM heap per pod (Micrometer), for the memory-exhaustion forecast. Optional.
+  prometheus/kubeguard:
+    config:
+      scrape_configs:
+        - job_name: kubeguard-jvm-heap
+          scrape_interval: 5s
+          metrics_path: /q/metrics
+          dns_sd_configs:
+            - names: [my-app.my-namespace.svc.cluster.local]
+              type: A
+              port: 8080
+              refresh_interval: 30s
+
+processors:
+  batch: {}
+  # Keep only what KubeGuard evaluates.
+  filter/kubeguard:
+    trace_conditions:
+      - span.kind != SPAN_KIND_CLIENT and span.kind != SPAN_KIND_SERVER
+  filter/kubeguard-pods:
+    metric_conditions:
+      - not (metric.name == "k8s.container.restarts" or metric.name == "k8s.container.ready" or metric.name == "k8s.container.status.reason")
+  filter/kubeguard-heap:
+    metric_conditions:
+      - not (metric.name == "jvm_memory_used_bytes" or metric.name == "jvm_memory_max_bytes")
+
+exporters:
+  otlp_http/kubeguard:
+    endpoint: http://kubeguard.kubeguard.svc:8080
+    encoding: json
+    compression: none
+    timeout: 5s
+    sending_queue:
+      queue_size: 100
+    retry_on_failure:
+      max_elapsed_time: 30s
+
+service:
+  pipelines:
+    traces/kubeguard:
+      receivers: [otlp]
+      processors: [filter/kubeguard, batch]
+      exporters: [otlp_http/kubeguard]
+    metrics/kubeguard:
+      receivers: [k8s_cluster]
+      processors: [filter/kubeguard-pods, batch]
+      exporters: [otlp_http/kubeguard]
+    logs/kubeguard:
+      receivers: [k8sobjects]
+      processors: [batch]
+      exporters: [otlp_http/kubeguard]
+    metrics/kubeguard-heap:
+      receivers: [prometheus/kubeguard]
+      processors: [filter/kubeguard-heap, batch]
+      exporters: [otlp_http/kubeguard]

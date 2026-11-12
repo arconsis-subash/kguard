@@ -1,0 +1,28 @@
+# KubeGuard scenario 1: slow downstream API.
+# Delays all packets leaving the "pricing" stub by 800ms (+-100ms), so every call from mock-backend to
+# pricing takes ~0.8-1.7s instead of a few ms. KubeGuard's downstream-latency rule (p95 > 500ms) fires.
+#
+# Scope: only the pricing pod in kubeguard-demo. Ends by itself after 10 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/downstream-latency.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/downstream-latency.yaml   # recover
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubeguard-downstream-latency
+  namespace: kubeguard-demo
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - kubeguard-demo
+    labelSelectors:
+      app.kubernetes.io/name: pricing
+  delay:
+    latency: 800ms
+    jitter: 100ms
+    correlation: "0"
+  direction: to
+  duration: 10m

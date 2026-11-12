@@ -1,0 +1,14 @@
+{{- if .Values.kubeguard.enabled }}
+{{- $ctx := dict "name" "kubeguard" "root" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubeguard-config
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+data:
+  application.properties: |
+    {{- range $key, $value := .Values.kubeguard.properties }}
+    {{ $key }}={{ $value }}
+    {{- end }}
+{{- end }}

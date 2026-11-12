@@ -1,0 +1,32 @@
+# KubeGuard scenario 2: dependency unreachable.
+# Network partition between mock-backend and the "inventory" stub: packets are dropped, so calls fail with
+# connect/request timeouts and never get a response. KubeGuard's dependency-connectivity rule fires.
+#
+# Scope: only traffic between the mock-backend and inventory pods in kubeguard-demo; pricing keeps
+# working. Ends by itself after 10 minutes as a safety net.
+#   kubectl apply -f chaos-mesh/experiments/kubeguard/dependency-connectivity.yaml
+#   kubectl delete -f chaos-mesh/experiments/kubeguard/dependency-connectivity.yaml   # recover
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubeguard-dependency-connectivity
+  namespace: kubeguard-demo
+  labels:
+    app.kubernetes.io/part-of: kubeguard-demo
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - kubeguard-demo
+    labelSelectors:
+      app.kubernetes.io/name: inventory
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - kubeguard-demo
+      labelSelectors:
+        app.kubernetes.io/name: mock-backend
+  duration: 10m

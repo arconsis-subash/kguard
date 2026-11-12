@@ -1,0 +1,48 @@
+{{- if .Values.downstreams.enabled }}
+{{- range .Values.downstreams.services }}
+{{- $ctx := dict "name" .name "root" $ }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+    app.kubernetes.io/component: downstream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeguard-demo.labels" $ctx | nindent 8 }}
+        app.kubernetes.io/component: downstream
+    spec:
+      containers:
+        - name: http-echo
+          image: "{{ $.Values.downstreams.image.repository }}:{{ $.Values.downstreams.image.tag }}"
+          args: {{ list "-listen=:5678" (printf "-text=%s" .text) | toJson }}
+          ports:
+            - name: http
+              containerPort: 5678
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubeguard-demo.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: 5678
+      targetPort: http
+{{- end }}
+{{- end }}

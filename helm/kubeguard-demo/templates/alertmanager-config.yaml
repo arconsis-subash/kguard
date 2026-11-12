@@ -1,0 +1,26 @@
+{{- if .Values.alertmanager.enabled }}
+{{- $ctx := dict "name" "alertmanager" "root" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  labels:
+    {{- include "kubeguard-demo.labels" $ctx | nindent 4 }}
+data:
+  alertmanager.yml: |
+    route:
+      receiver: ops-agent-webhook
+      # One notification per service: alerts that fire together (cause and symptom) reach the
+      # responder in one webhook call and are handled as one incident.
+      group_by: [service]
+      group_wait: {{ .Values.alertmanager.route.groupWait }}
+      group_interval: {{ .Values.alertmanager.route.groupInterval }}
+      repeat_interval: {{ .Values.alertmanager.route.repeatInterval }}
+    receivers:
+      - name: ops-agent-webhook
+        webhook_configs:
+          {{- range .Values.alertmanager.webhookUrls }}
+          - url: {{ . | quote }}
+            send_resolved: true
+          {{- end }}
+{{- end }}
